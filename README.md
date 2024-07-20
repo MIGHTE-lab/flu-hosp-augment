@@ -6,7 +6,7 @@ This repository contains supporting code for the submitted manuscript *A prospec
 
 In `./scripts`, we provide scripts demonstrating how we implemented all the models used (e.g. VAR, ARIMA, LGBM), as well as how we performed the transfer learning stage necessary to use ILI to augment hospitalization data (i.e. `stitch.Rmd`). These are the main files of interest in terms of the paper.
 
-For space reasons we include representative examples of the used. The full data can be readily obtained from the CDC's [FluView portal](https://www.cdc.gov/flu/weekly/fluviewinteractive.htm). We include some demonstrative CSV files to indicate how the intermediate steps in our pipeline look.
+For space reasons we include representative examples of the data used. The full data can be readily obtained from the CDC's [FluView portal](https://www.cdc.gov/flu/weekly/fluviewinteractive.htm). We include some demonstrative CSV files to indicate how the intermediate steps in our pipeline look.
 
 In practice, this code was adapted to run weekly to append the CDC new week's data release, with new prediction files generated into the `./predictions` folder.
 
