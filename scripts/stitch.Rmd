@@ -1,0 +1,233 @@
+---
+title: "Stitch_ILInet"
+author: "Austin Meyer"
+date: '2022-10-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(MMWRweek)
+library(lubridate)
+library(caret)
+library(kableExtra)
+library(bestNormalize)
+
+setwd('.')
+
+transformed <- function(x) {
+  bn <- bestNormalize(x)
+  return(bn$x.t)
+}
+
+population <- read_csv('locations.csv') %>%
+  dplyr::select(location_name, population)
+```
+
+## Pull Data
+```{r}
+ df.ilinet <- read_csv('ILINet_2024-06-01.csv') %>%
+  mutate(location_name = REGION, 
+         ili = as.numeric(`%UNWEIGHTED ILI`), 
+         date = MMWRweek2Date(MMWRyear = `YEAR`, MMWRweek = `WEEK`, MMWRday = 7)) %>%
+  dplyr::select(date, location_name, ili) %>%
+  drop_na() %>%
+  group_by(location_name) %>%
+  mutate(ili = transformed(ili + 1)) %>%
+  ungroup() %>%
+  filter(date <= mdy('06/30/2019')) %>%
+  drop_na() %>%
+  filter(location_name != 'Florida' &
+           location_name != 'Puerto Rico' &
+           location_name != 'Virgin Islands')
+
+df.hosp <- read_csv('eip_cleaned.csv') %>%
+  mutate(location_name = ifelse(CATCHMENT == 'Entire Network', 'US', CATCHMENT)) %>%
+  mutate(hosp = log(`WEEKLY RATE` + 1),
+         #hosp = `WEEKLY RATE`,
+         date = MMWRweek2Date(MMWRyear = `MMWR-YEAR`, MMWRweek = `MMWR-WEEK`, MMWRday = 7)) %>%
+  filter(date <= mdy('06/30/2019')) %>%
+  dplyr::select(date, location_name, hosp) %>%
+  filter(location_name != 'Florida' &
+           location_name != 'Puerto Rico' &
+           location_name != 'Virgin Islands')
+```
+
+## Merge Data
+```{r}
+df.combined <- df.hosp %>% 
+  full_join(df.ilinet, by = c('date', 'location_name')) %>%
+  filter(!(location_name %in% c('Florida','Puerto Rico','Virgin Islands')))
+```
+
+## Plot Example
+```{r, fig.align='center', fig.width = 9, fig.height = 3.5}
+df.plot <- df.combined %>%
+  drop_na() %>%
+  pivot_longer(-c(date, location_name))
+
+p1 <- df.combined |> 
+  mutate(hospitalizations = hosp, ILI = ili) |>
+  drop_na() |>
+  pivot_longer(-c(date, location_name, hosp, ili)) |>
+  ggplot(aes(date, value, color = name, fill = name)) +
+  geom_line(alpha = 0.6) + 
+  facet_wrap(~location_name, ncol = 5, scales = 'free_y') + 
+  theme_bw() +
+  scale_color_manual(name = NULL, values = c(hospitalizations = 'black', ILI = 'red')) +
+  scale_fill_manual(name = NULL, values = c(hospitalizations = 'black', ILI = 'red')) + 
+  theme(legend.position = 'top',
+        legend.justification = 'right',
+        legend.text = element_text(size = 9),
+        legend.box.spacing = unit(0, "pt"),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#ggsave(plot = p1, 'figures_paper/model_timeseries.png', width = 9, height = 3.5, dpi = 300)
+#ggsave(plot = p1, 'figures_paper/model_timeseries.pdf', width = 9, height = 3.5)
+show(p1)
+```
+
+```{r, fig.align='center', fig.width = 9, fig.height = 9}
+p2 <- ggplot(df.plot %>% pivot_wider(names_from = name, values_from = value) %>% drop_na(),
+             aes(ili, hosp, color = location_name, fill = location_name)) +
+  geom_point(alpha = 0.6) + 
+  xlab('Normalized Unweighted ILI percentage') +
+  ylab('Log(Hospitalizations + 1)') +
+  theme_bw(18) +
+  scale_color_discrete(name = NULL) +
+  scale_fill_discrete(name = NULL) +
+  theme(legend.position = "top")
+  
+show(p2)
+```
+
+```{r, fig.align='center', fig.width = 9, fig.height = 3.5}
+p3 <- ggplot(df.plot %>% pivot_wider(names_from = name, values_from = value) %>% drop_na(),
+             aes(ili, hosp)) +
+  geom_point(alpha = 0.5) + 
+  facet_wrap(~location_name, ncol = 5) + 
+  xlab('Normalized Unweighted ILI percentage') +
+  ylab('Log(Hospitalizations + 1)') +
+  theme_bw()
+  
+show(p3)
+
+ggsave(plot = p3, 'figures_paper/model_scatter.png', width = 9, height = 3.5, dpi = 300)
+ggsave(plot = p3, 'figures_paper/model_scatter.pdf', width = 9, height = 3.5)
+```
+
+## Make Regression Models
+```{r}
+df.models <- df.combined %>% 
+  drop_na() %>% 
+  group_by(location_name) %>% 
+  do({model = lm(hosp ~ ili, data = .);
+       data.frame(int = coef(model)[1],
+                  slope = coef(model)[2],
+                  p = summary(model)$coefficients[2,4],
+                  r2 = summary(model)$r.squared)})
+
+t1 <- df.models %>%
+  kbl() %>%
+  kable_paper('striped', 
+              full_width = F,
+              html_font = 'sans-serif')
+
+t1
+```
+
+## Combined Model
+```{r}
+df.final <- df.plot %>% pivot_wider(names_from = name, values_from = value) %>% drop_na()
+
+mod <- lm(hosp ~ ili, df.final)
+
+summary(mod)
+```
+
+## Output Predicted Hospitalizations for Plotting
+```{r}
+tmp.ilinet <- read_csv('ILINet_2024-06-01.csv') %>%
+  mutate(location_name = REGION, 
+         ili = as.numeric(`%UNWEIGHTED ILI`), 
+         date = MMWRweek2Date(MMWRyear = `YEAR`, MMWRweek = `WEEK`, MMWRday = 7)) %>%
+  dplyr::select(date, location_name, ili) %>%
+  drop_na() %>%
+  group_by(location_name) %>%
+  mutate(ili = transformed(ili + 1)) %>%
+  ungroup() %>%
+  drop_na() %>%
+  filter(location_name != 'Florida' &
+           location_name != 'Puerto Rico' &
+           location_name != 'Virgin Islands')
+
+tmp.predicted.hosp <- bind_cols(tmp.ilinet, pred_hosp = round(exp(predict(mod, tmp.ilinet)) - 1, digits = 2)) %>%
+  mutate(pred_hosp = ifelse(pred_hosp < 0, 0, pred_hosp))
+
+write_csv(tmp.predicted.hosp, file = 'predicted_hosp.csv')
+```
+## Make Historical Time Series
+```{r, fig.align='center', fig.width = 9, fig.height = 40}
+predicted.hosp <- bind_cols(df.ilinet, pred_hosp = round(exp(predict(mod, df.ilinet)) - 1, digits = 2)) %>%
+  mutate(pred_hosp = ifelse(pred_hosp < 0, 0, pred_hosp))
+
+p4 <- ggplot(predicted.hosp, aes(date, pred_hosp)) + 
+  geom_line() +
+  facet_wrap(~location_name, ncol = 3, scale = 'free_y') +
+  theme_bw()
+
+show(p4)
+```
+
+## Compare To Current Data
+```{r, fig.align='center', fig.width = 9, fig.height = 30}
+df.old.true.hosp <- read_csv('Flusight-forecast-data/data-truth/truth-Incident Hospitalizations.csv') %>%
+  filter(date >= mdy('07/01/2021') & date <  mdy('06/01/2022')) %>%
+  mutate(true_hosp = value) %>%
+  select(-value, -location)
+
+df.true.hosp <- read_csv('FluSight-forecast-hub/target-data/target-hospital-admissions.csv') %>%
+  filter(date >= mdy('06/01/2022')) %>%
+  mutate(true_hosp = value) %>%
+  select(-'...1', -value, -location, -weekly_rate) %>%
+  full_join(df.old.true.hosp)
+
+df.combined.hosp <- predicted.hosp %>% 
+  filter(date <= mdy('06/30/2019')) %>%
+  mutate(date = date + days(728)) %>%
+  full_join(df.true.hosp, by = c('date', 'location_name')) %>%
+  inner_join(population, by = 'location_name') %>%
+  mutate(total_hosp = round(coalesce(pred_hosp * population / 100000, true_hosp))) %>%
+  arrange(location_name, date) %>%
+  filter(location_name != 'Virgin Islands')
+
+sanity <- df.combined.hosp %>% arrange(location_name, date) %>% group_by(location_name) %>% mutate(diffs = difftime(date , lag(date, 1)))
+unique(sanity$diffs)
+#cor.test(df.combined.hosp$pred_hosp, df.combined.hosp$true_hosp)
+
+p5 <- ggplot(df.combined.hosp, aes(date, total_hosp)) + 
+  geom_point(size = 1.1, alpha = 0.3) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~location_name, ncol = 3, scales = 'free_y') +
+  theme_bw()
+
+show(p5)
+```
+
+## Output Stitched Time Series
+```{r}
+write_csv(df.combined.hosp, 'imputed_and_stitched_hosp.csv')
+```
+
+## Compare To Current Data
+```{r, fig.align='center', fig.width = 9, fig.height = 30}
+p6 <- ggplot(df.combined.hosp %>% filter(date >= mdy('06/01/2023')), aes(date, total_hosp)) + 
+  geom_point(size = 1.1, alpha = 0.3) +
+  geom_line(alpha = 0.5) +
+  facet_wrap(~location_name, ncol = 3, scales = 'free_y') +
+  theme_bw()
+
+show(p6)
+```

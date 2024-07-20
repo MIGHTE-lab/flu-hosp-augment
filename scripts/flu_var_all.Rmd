@@ -1,0 +1,836 @@
+---
+title: "Flu VAR"
+author: "Austin Meyer"
+date: "2023"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = F, 
+                      warning = F, 
+                      message = F, 
+                      fig.align = 'center', 
+                      fig.width = 6)
+
+setwd('.')
+```
+
+```{r}
+# Startup
+
+needed.packages <- c('MLmetrics',
+                     'janitor',
+                     'fpp2',
+                     'forecast',
+                     'vars',
+                     'kableExtra',
+                     'geosphere',
+                     'sp',
+                     'ggdendro',
+                     'colorspace',
+                     'lubridate',
+                     'tidyverse',
+                     'imputeTS',
+                     'magrittr',
+                     'BigVAR',
+                     'webshot')
+
+new.packages <- needed.packages[!(needed.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages,repos = "http://cran.us.r-project.org")
+
+suppressPackageStartupMessages(library(easypackages))
+suppressPackageStartupMessages(libraries(needed.packages))
+
+cut_date <- mdy('11/01/2023')
+lam <- 0
+all_times <- tibble()
+```
+
+```{r, echo = F}
+make.ts.data <- function(tdf, lthese_places) {
+  tdf %>% 
+    dplyr::select(date, location_name, value) %>%
+    filter(location_name %in% lthese_places) %>%
+    pivot_wider(names_from = location_name, values_from = value)
+}
+
+# generate errors for entire set
+generate.total.errors <- function(ldf) {
+  lt <- ldf %>% 
+    group_by(horizon) %>%
+    summarise('Model RMSE' = RMSE(prediction, real),
+              'Persistence RMSE' = RMSE(persistence, real),
+              'Model MAE' = MAE(prediction, real),
+              'Persistence MAE' = MAE(persistence, real),
+              'Model R2' = R2_Score(prediction, real),
+              'Persistence R2' = R2_Score(persistence, real))
+}
+
+# generate errors for individual regions
+generate.individual.errors <- function(ldf) {
+  lpred <- ldf %>% 
+    group_by(region, horizon) %>% 
+    summarise(VAR.MAE = round(MAE(prediction, real), digits = 2),
+              Per.MAE = round(MAE(persistence, real), digits = 2),
+              VAR.RMSE = round(RMSE(prediction, real), digits = 2),
+              Per.RMSE = round(RMSE(persistence, real), digits = 2))
+}
+
+generate.retrospective.output <- function(ldf, agg.label, model.label, target.label, horizon.label) {
+  lpred <- ldf %>%
+    dplyr::select(time, region, prediction, real) %>%
+    set_names(c('date_predicted', 'location_name', 'value', 'target_value')) %>%
+    mutate(date_created = Sys.Date(),
+           date_predicted = format(date_predicted, '%Y-%m%-%d'),
+           location_name = location_name,
+           aggregation = agg.label, 
+           target = target.label,
+           model = model.label, 
+           horizon = horizon.label) %>%
+    relocate(any_of(c("date_created", "date_predicted", 
+                      "aggregation", 'location_name',
+                      'model', 'target', 'horizon', 
+                      'value', 'target_value')))
+}
+
+generate.regularized.future.output <- function(ltsdata, ldf, lhor, llam, agg.label, model.label, target.label, horizon.label, ldisplay.names) {
+  lpred <- as_tibble(ldf) %>% 
+    mutate(location_name = rownames(ldf)) %>%
+    mutate(date_predicted = ceiling_date(rep(max(ltsdata$date) %m+% weeks(lhor), nrow(ldf)), 'week') - days(1),
+           value = round(InvBoxCox(value, lambda = llam) - 1)) %>%
+    dplyr::select(location_name, date_predicted, value) %>%
+    mutate(date_created = Sys.Date(),
+           date_predicted = format(date_predicted, '%Y-%m%-%d'),
+           location_name = location_name,
+           aggregation = agg.label, 
+           model = model.label, 
+           target = target.label,
+           target_value = NA,
+           horizon = horizon.label) %>%
+    relocate(any_of(c("date_created", "date_predicted", 
+                      "aggregation", 'location_name',
+                      'model', 'target', 'horizon', 
+                      'value', 'target_value')))
+}
+
+plot.predictions <- function(ldf) {
+  cols <- c('red', 'black')
+  ggplot(ldf %>% pivot_longer(c(real, prediction)), 
+         aes(x = time, y = value, color = name)) + 
+    geom_line(size = 1.0,
+              alpha = 0.6) + 
+    xlab('time (weeks)') + 
+    facet_wrap(~region, ncol = 2, scales = 'free_y') +
+    scale_color_manual(
+      name = NULL,
+      values = darken(cols, 0.3)
+    ) +
+    theme_bw(12) +
+    theme(
+      legend.position = "top",
+      legend.justification = "right",
+      legend.text = element_text(size = 16),
+      legend.box.spacing = unit(0, "pt")
+    )
+}
+```
+
+```{r, fig.height = 20, fig.width = 11, include = F}
+# Import and clean the data
+
+# filt_data <- read_csv('../Flusight-forecast-data/data-truth/truth-Incident Hospitalizations.csv') %>%
+#   pivot_wider(!location, names_from = location_name, values_from = value) %>%
+#   drop_na() %>%
+#   pivot_longer(!date, names_to = 'location_name', values_to = 'value')
+
+filt_data <- read_csv('../imputed_and_stitched_hosp.csv') %>%
+  filter(location_name != 'Virgin Islands') %>%
+  mutate(value = total_hosp) %>%
+  dplyr::select(date, location_name, value) %>%
+  pivot_wider(names_from = location_name, values_from = value) %>%
+  drop_na() %>%
+  pivot_longer(!date, names_to = 'location_name', values_to = 'value')
+
+these_places <- unique(filt_data$location_name)
+```
+
+```{r, eval = T}
+### Make fit
+
+horizon <- 1
+num_lags <- 6
+
+ts_data <- make.ts.data(filt_data, these_places)
+
+train.ts <- ts(ts_data %>% 
+                 filter(date < cut_date) %>% 
+                 dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon, 
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+test.ts <- ts_data %>% filter(date >= cut_date)
+times <- ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1)
+
+for(j in 1:(nrow(ts_data %>% filter(date >= cut_date)))){
+  #cat(paste('Prediction:', times[j], '\n'))
+  chop_date <- (floor_date(cut_date %m+% weeks(j), 'week'))
+  
+  train.ts <- ts(ts_data %>% 
+                   filter(date < chop_date) %>% 
+                   dplyr::select(-date))
+  
+  test.ts <- ts_data %>% 
+    filter(date >= chop_date)
+  times <- c(times, ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1))
+  
+  new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+  
+  final.var.model <- constructModel(as.matrix(new.train.ts),
+                                    p = num_lags, 
+                                    h = horizon,
+                                    struct = 'HLAGOO',
+                                    cv = "Rolling",
+                                    gran = c(100, 10),
+                                    verbose = F
+  )
+  
+  final.var.fit <- cv.BigVAR(final.var.model)
+  
+  t.pred <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+    `colnames<-`(colnames(new.train.ts)) %>%
+    as_tibble()
+  
+  pred.var <- bind_rows(pred.var, t.pred)
+}
+
+predictions <- round(InvBoxCox(pred.var, lambda = lam) - 1)
+predictions <- predictions %>% 
+  bind_cols(tibble(time = times)) %>% 
+  pivot_longer(!time)
+
+test.ts <- ts_data %>% 
+  filter(date >= cut_date %m-% weeks(1)) %>%
+  pivot_longer(-date) %>%
+  group_by(name) %>%
+  mutate(persistence = lag(value, order_by = date)) %>%
+  ungroup() %>%
+  drop_na()
+
+colnames(predictions) <- c('time', 'region', 'prediction')
+colnames(test.ts) <- c('time', 'region', 'real', 'persistence')
+combined_predictions <- test.ts %>% 
+  inner_join(predictions) %>%
+  drop_na() %>%
+  mutate(prediction = ifelse(prediction <= 0, 0, prediction))
+
+all_times <- bind_rows(all_times, combined_predictions %>% mutate(horizon = horizon))
+```
+
+```{r, eval = T}
+retro_predictions <- generate.retrospective.output(combined_predictions, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(retro_predictions, file = 'flu_var_predictions_all.csv', append = F)
+```
+
+```{r, eval = T}
+### Future prediction
+
+train.ts <- ts(ts_data %>% dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+pred.var <- t(pred.var)
+colnames(pred.var) <- c('value')
+
+future_predictions <- generate.regularized.future.output(ts_data, pred.var, horizon, lam, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(future_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Make fit
+
+horizon <- 2
+num_lags <- 6
+
+ts_data <- make.ts.data(filt_data, these_places)
+
+train.ts <- ts(ts_data %>% 
+                 filter(date < cut_date) %>% 
+                 dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+test.ts <- ts_data %>% filter(date >= cut_date)
+times <- ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1)
+
+for(j in 1:(nrow(ts_data %>% filter(date >= cut_date)))){
+  #cat(paste('Prediction:', j, '\n'))
+  chop_date <- (floor_date(cut_date %m+% weeks(j), 'week'))
+  
+  train.ts <- ts(ts_data %>% 
+                   filter(date < chop_date) %>% 
+                   dplyr::select(-date))
+  
+  test.ts <- ts_data %>% 
+    filter(date >= chop_date)
+  times <- c(times, ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1))
+  
+  new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+  
+  final.var.model <- constructModel(as.matrix(new.train.ts),
+                                    p = num_lags, 
+                                    h = horizon,
+                                    struct = 'HLAGOO',
+                                    cv = "Rolling",
+                                    gran = c(100, 10),
+                                    verbose = F
+  )
+  
+  final.var.fit <- cv.BigVAR(final.var.model)
+  
+  t.pred <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+    `colnames<-`(colnames(new.train.ts)) %>%
+    as_tibble()
+  
+  pred.var <- bind_rows(pred.var, t.pred)
+}
+
+predictions <- round(InvBoxCox(pred.var, lambda = lam) - 1)
+predictions <- predictions %>% 
+  bind_cols(tibble(time = times)) %>% 
+  pivot_longer(!time)
+
+test.ts <- ts_data %>% 
+  filter(date >= cut_date %m-% weeks(1)) %>%
+  pivot_longer(-date) %>%
+  group_by(name) %>%
+  mutate(persistence = lag(value, order_by = date, n = horizon)) %>%
+  ungroup() %>%
+  drop_na()
+
+colnames(predictions) <- c('time', 'region', 'prediction')
+colnames(test.ts) <- c('time', 'region', 'real', 'persistence')
+combined_predictions <- test.ts %>% 
+  inner_join(predictions) %>%
+  drop_na() %>%
+  mutate(prediction = ifelse(prediction <= 0, 0, prediction))
+
+all_times <- bind_rows(all_times, combined_predictions %>% mutate(horizon = horizon))
+```
+
+```{r, eval = T}
+retro_predictions <- generate.retrospective.output(combined_predictions, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(retro_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Future prediction
+
+train.ts <- ts(ts_data %>% dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+pred.var <- t(pred.var)
+colnames(pred.var) <- c('value')
+
+future_predictions <- generate.regularized.future.output(ts_data, pred.var, horizon, lam, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(future_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Make fit
+
+horizon <- 3
+num_lags <- 6
+
+ts_data <- make.ts.data(filt_data, these_places)
+
+train.ts <- ts(ts_data %>% 
+                 filter(date < cut_date) %>% 
+                 dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+test.ts <- ts_data %>% filter(date >= cut_date)
+times <- ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1)
+
+for(j in 1:(nrow(ts_data %>% filter(date >= cut_date)))){
+  #cat(paste('Prediction:', j, '\n'))
+  chop_date <- (floor_date(cut_date %m+% weeks(j), 'week'))
+  
+  train.ts <- ts(ts_data %>% 
+                   filter(date < chop_date) %>% 
+                   dplyr::select(-date))
+  
+  test.ts <- ts_data %>% 
+    filter(date >= chop_date)
+  times <- c(times, ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1))
+  
+  new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+  
+  final.var.model <- constructModel(as.matrix(new.train.ts),
+                                    p = num_lags, 
+                                    h = horizon,
+                                    struct = 'HLAGOO',
+                                    cv = "Rolling",
+                                    gran = c(100, 10),
+                                    verbose = F
+  )
+  
+  final.var.fit <- cv.BigVAR(final.var.model)
+  
+  t.pred <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+    `colnames<-`(colnames(new.train.ts)) %>%
+    as_tibble()
+  
+  pred.var <- bind_rows(pred.var, t.pred)
+}
+
+predictions <- round(InvBoxCox(pred.var, lambda = lam) - 1)
+predictions <- predictions %>% 
+  bind_cols(tibble(time = times)) %>% 
+  pivot_longer(!time)
+
+test.ts <- ts_data %>% 
+  filter(date >= cut_date %m-% weeks(1)) %>%
+  pivot_longer(-date) %>%
+  group_by(name) %>%
+  mutate(persistence = lag(value, order_by = date, n = horizon)) %>%
+  ungroup() %>%
+  drop_na()
+
+colnames(predictions) <- c('time', 'region', 'prediction')
+colnames(test.ts) <- c('time', 'region', 'real', 'persistence')
+combined_predictions <- test.ts %>% 
+  inner_join(predictions) %>%
+  drop_na() %>%
+  mutate(prediction = ifelse(prediction <= 0, 0, prediction))
+
+all_times <- bind_rows(all_times, combined_predictions %>% mutate(horizon = horizon))
+```
+
+```{r, eval = T}
+retro_predictions <- generate.retrospective.output(combined_predictions, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(retro_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Future prediction
+
+train.ts <- ts(ts_data %>% dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+pred.var <- t(pred.var)
+colnames(pred.var) <- c('value')
+
+future_predictions <- generate.regularized.future.output(ts_data, pred.var, horizon, lam, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(future_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Make fit
+
+horizon <- 4
+num_lags <- 6
+
+ts_data <- make.ts.data(filt_data, these_places)
+
+train.ts <- ts(ts_data %>% 
+                 filter(date < cut_date) %>% 
+                 dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+test.ts <- ts_data %>% filter(date >= cut_date)
+times <- ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1)
+
+for(j in 1:(nrow(ts_data %>% filter(date >= cut_date)))){
+  #cat(paste('Prediction:', j, '\n'))
+  chop_date <- (floor_date(cut_date %m+% weeks(j), 'week'))
+  
+  train.ts <- ts(ts_data %>% 
+                   filter(date < chop_date) %>% 
+                   dplyr::select(-date))
+  
+  test.ts <- ts_data %>% 
+    filter(date >= chop_date)
+  times <- c(times, ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1))
+  
+  new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+  
+  final.var.model <- constructModel(as.matrix(new.train.ts),
+                                    p = num_lags, 
+                                    h = horizon,
+                                    struct = 'HLAGOO',
+                                    cv = "Rolling",
+                                    gran = c(100, 10),
+                                    verbose = F
+  )
+  
+  final.var.fit <- cv.BigVAR(final.var.model)
+  
+  t.pred <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+    `colnames<-`(colnames(new.train.ts)) %>%
+    as_tibble()
+  
+  pred.var <- bind_rows(pred.var, t.pred)
+}
+
+predictions <- round(InvBoxCox(pred.var, lambda = lam) - 1)
+predictions <- predictions %>% 
+  bind_cols(tibble(time = times)) %>% 
+  pivot_longer(!time)
+
+test.ts <- ts_data %>% 
+  filter(date >= cut_date %m-% weeks(1)) %>%
+  pivot_longer(-date) %>%
+  group_by(name) %>%
+  mutate(persistence = lag(value, order_by = date, n = horizon)) %>%
+  ungroup() %>%
+  drop_na()
+
+colnames(predictions) <- c('time', 'region', 'prediction')
+colnames(test.ts) <- c('time', 'region', 'real', 'persistence')
+combined_predictions <- test.ts %>% 
+  inner_join(predictions) %>%
+  drop_na() %>%
+  mutate(prediction = ifelse(prediction <= 0, 0, prediction))
+
+all_times <- bind_rows(all_times, combined_predictions %>% mutate(horizon = horizon))
+```
+
+```{r, eval = T}
+retro_predictions <- generate.retrospective.output(combined_predictions, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(retro_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Future prediction
+
+train.ts <- ts(ts_data %>% dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+pred.var <- t(pred.var)
+colnames(pred.var) <- c('value')
+
+future_predictions <- generate.regularized.future.output(ts_data, pred.var, horizon, lam, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(future_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Make fit
+
+horizon <- 5
+num_lags <- 6
+
+ts_data <- make.ts.data(filt_data, these_places)
+
+train.ts <- ts(ts_data %>% 
+                 filter(date < cut_date) %>% 
+                 dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+test.ts <- ts_data %>% filter(date >= cut_date)
+times <- ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1)
+
+for(j in 1:(nrow(ts_data %>% filter(date >= cut_date)))){
+  #cat(paste('Prediction:', j, '\n'))
+  chop_date <- (floor_date(cut_date %m+% weeks(j), 'week'))
+  
+  train.ts <- ts(ts_data %>% 
+                   filter(date < chop_date) %>% 
+                   dplyr::select(-date))
+  
+  test.ts <- ts_data %>% 
+    filter(date >= chop_date)
+  times <- c(times, ceiling_date(min(test.ts$date) %m+% weeks(horizon - 1), 'week') - days(1))
+  
+  new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+  
+  final.var.model <- constructModel(as.matrix(new.train.ts),
+                                    p = num_lags, 
+                                    h = horizon,
+                                    struct = 'HLAGOO',
+                                    cv = "Rolling",
+                                    gran = c(100, 10),
+                                    verbose = F
+  )
+  
+  final.var.fit <- cv.BigVAR(final.var.model)
+  
+  t.pred <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+    `colnames<-`(colnames(new.train.ts)) %>%
+    as_tibble()
+  
+  pred.var <- bind_rows(pred.var, t.pred)
+}
+
+predictions <- round(InvBoxCox(pred.var, lambda = lam) - 1)
+predictions <- predictions %>% 
+  bind_cols(tibble(time = times)) %>% 
+  pivot_longer(!time)
+
+test.ts <- ts_data %>% 
+  filter(date >= cut_date %m-% weeks(1)) %>%
+  pivot_longer(-date) %>%
+  group_by(name) %>%
+  mutate(persistence = lag(value, order_by = date, n = horizon)) %>%
+  ungroup() %>%
+  drop_na()
+
+colnames(predictions) <- c('time', 'region', 'prediction')
+colnames(test.ts) <- c('time', 'region', 'real', 'persistence')
+combined_predictions <- test.ts %>% 
+  inner_join(predictions) %>%
+  drop_na() %>%
+  mutate(prediction = ifelse(prediction <= 0, 0, prediction))
+
+all_times <- bind_rows(all_times, combined_predictions %>% mutate(horizon = horizon))
+```
+
+```{r, eval = T}
+retro_predictions <- generate.retrospective.output(combined_predictions, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(retro_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+```{r, eval = T}
+### Future prediction
+
+train.ts <- ts(ts_data %>% dplyr::select(-date))
+
+new.train.ts <- BoxCox(train.ts + 1, lambda = lam)
+
+final.var.model <- constructModel(as.matrix(new.train.ts),
+                                  p = num_lags, 
+                                  h = horizon,
+                                  struct = 'HLAGOO',
+                                  cv = "Rolling",
+                                  gran = c(100, 10),
+                                  verbose = F
+)
+
+final.var.fit <- cv.BigVAR(final.var.model)
+
+pred.var <- t(predict(final.var.fit, n.ahead = horizon)) %>%
+  `colnames<-`(colnames(new.train.ts)) %>%
+  as_tibble()
+
+pred.var <- t(pred.var)
+colnames(pred.var) <- c('value')
+
+future_predictions <- generate.regularized.future.output(ts_data, pred.var, horizon, lam, 'weekly', 'VAR_regularized', 'value', horizon)
+
+write_csv(future_predictions, file = 'flu_var_predictions_all.csv', append = T)
+```
+
+## Overall fit
+
+```{r, eval = T}
+to.table <- generate.total.errors(all_times %>% drop_na())
+
+t1 <- to.table %>%
+  kbl() %>%
+  kable_paper('striped', 
+              full_width = F,
+              html_font = 'sans-serif')
+t1
+```
+
+## Regional fits
+
+```{r, eval = T}
+to.table <- generate.individual.errors(all_times %>% drop_na())
+
+t2 <- to.table %>%
+  kbl() %>%
+  kable_paper('striped', 
+              full_width = F,
+              html_font = 'sans-serif')
+
+t2
+```
+
+# Make final plot with future predictions
+
+```{r, , fig.width = 9, fig.height = 24, eval = T}
+df <- read_csv('flu_var_predictions_all.csv') %>%
+  arrange(location_name, date_predicted)
+
+write_csv(df, file = 'flu_var_predictions_all.csv')
+          
+df %<>% mutate(value = as.numeric(value)) %>%
+  pivot_longer(c(value, target_value), names_to = 'series', values_to = 'values') %>%
+  filter(model == 'VAR_regularized') %>%
+  filter((series == 'target_value' & horizon == 1) | date_predicted > max(filt_data$date)) %>%
+  mutate(series = ifelse(series == 'target_value', 'real', 'predicted')) %>%
+  drop_na()
+
+cols <- c('red', 'black')
+p <- ggplot(df, 
+            aes(x = date_predicted, y = values, color = series, fill = series)) + 
+  geom_line(size = 1.0,
+            alpha = 0.6) +
+  geom_point(alpha = 0.5) +
+  xlab('time (weeks)') + 
+  ylab('value') +
+  facet_wrap(~location_name, ncol = 3, scales = 'free_y') +
+  scale_color_manual(
+    name = NULL,
+    values = darken(cols, 0.3)
+  ) +
+  theme_bw(12) +
+  theme(
+    legend.position = "top",
+    legend.justification = "right",
+    legend.text = element_text(size = 16),
+    legend.box.spacing = unit(0, "pt")
+  )
+
+show(p)
+```
